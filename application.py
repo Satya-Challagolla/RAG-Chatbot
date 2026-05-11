@@ -1,7 +1,9 @@
 import os
+import re
 import tempfile
 import streamlit as st
 
+from langchain_core.documents import Document
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
@@ -13,7 +15,7 @@ from langchain_community.document_loaders import (
     UnstructuredPowerPointLoader,
     UnstructuredExcelLoader
 )
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -39,6 +41,7 @@ embeddings = load_embeddings()
 @st.cache_resource
 def load_vectorstore():
     vectorstore = Chroma(
+        collection_name= "rag_collection",
         persist_directory ="./chroma_db",
         embedding_function= embeddings
     )
@@ -47,14 +50,14 @@ def load_vectorstore():
 vectorstore = load_vectorstore()
 
 retriever = vectorstore.as_retriever(
-    search_type="mmr",
-    search_kwargs={"k": 2, "fetch_k": 5}
+    search_type="similarity_score_threshold",
+    search_kwargs={"k": 5, "score_threshold": 0.5 }
 )
 
 @st.cache_resource
 def load_llm():
-    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-large")
+    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-large")
     return tokenizer, model
 
 tokenizer, model = load_llm()
@@ -128,21 +131,73 @@ def process_uploaded_files(uploaded_files):
     status_text.text("✅Processing completed!")
     return all_docs
 
-def split_documents(documents):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=250,
-        chunk_overlap=30
-    )
-    
-    docs = splitter.split_documents(documents)
-    for i, doc in enumerate(docs):
-        doc.metadata["chunk_id"] = i
-    return docs
+def build_pageindex(documents):
+
+    indexed_docs = []
+
+    for doc in documents:
+
+        text = doc.page_content.strip()
+
+        if not text:
+            continue
+
+        # Better logical splitting
+        sections = re.split(
+            r'\n\s*\n',
+            text
+        )
+
+        for idx, section in enumerate(sections):
+
+            section = section.strip()
+
+            # Skip tiny sections
+            if len(section) < 30:
+                continue
+
+            # First line becomes title
+            lines = section.split("\n")
+
+            title = lines[0][:80]
+
+            new_doc = Document(
+                page_content=section,
+                metadata={
+                    "source": doc.metadata.get("source"),
+                    "page": doc.metadata.get("page"),
+                    "section_id": idx,
+                    "section_title": title
+                }
+            )
+
+            indexed_docs.append(new_doc)
+
+    return indexed_docs
+
+#Create document tree
+def create_document_tree(docs):
+    tree ={}
+    for doc in docs:
+        source = doc.metadata["source"]
+        if source not in tree:
+            tree[source] =[]
+        tree[source].append({
+            "page": doc.metadata["page"],
+            "section": doc.metadata["section_title"]
+        })
+    return tree
 
 def add_to_vectorstore(docs):
+    if not docs:
+        st.error("No valid sections found.")
+        return
+    
     vectorstore.add_documents(docs)
+
     try:
         vectorstore.persist()
+
     except:
         pass
 
@@ -155,7 +210,7 @@ def generate_answer(prompt):
     )
     outputs = model.generate(
         **inputs,
-        max_new_tokens=120,
+        max_new_tokens=250,
         temperature=0.2,
         do_sample=False
     )
@@ -166,34 +221,45 @@ def generate_answer(prompt):
     return answer
 
 def rag(query):
-    retrieved_docs = retriever.invoke(query)
+    raw_docs = retriever.invoke(query)
 
-    if not retrieved_docs:
-        return (
-            "❌ Sorry, I cannot find relevant information in the document for your query.",
-            []
-        )
-    
-    context = "\n\n".join(
-        [doc.page_content for doc in retrieved_docs]
-    )
+    seen = set()
+    retrieved_docs = []
+
+    for doc in raw_docs:
+
+        content = doc.page_content.strip()
+
+        if content not in seen:
+            seen.add(content)
+            retrieved_docs.append(doc)
+        
+    context = "\n\n".join([
+        f"""
+        SECTION:
+        {doc.metadata.get('section_title')}
+
+        CONTENT:
+        {doc.page_content}
+        """
+        for doc in retrieved_docs
+    ])
 
     prompt = f"""
     You are a knowledgeable AI assistant.
 
-    Answer the question ONLY from the provided context.
+    Answer the question using ALL relevant document sections.
 
-    Guidelines:
-    - First give a clear conceptual definition
-    - Ignore unrelated information
-    - Do NOT generate information outside the context
-    - Avoid copying large code blocks
-    - If code exists, explain it briefly in words
-    - Keep the answer concise and easy to understand
-    - Maximum 5 lines
-    - If the answer is not found in the context, respond exactly with:
+    Instructions:
+    - Combine information from multiple sections
+    - Give a complete conceptual explanation
+    - Mention important properties
+    - Keep answer concise but informative
+    - Do not hallucinate
+    - If answer not found, say:
     "Not found in document"
-    Context:
+
+    DOCUMENT SECTION:
     {context}
 
     Question:
@@ -229,13 +295,24 @@ with col1:
                 documents = process_uploaded_files(
                     uploaded_files
                 )
-                split_docs = split_documents(
+                indexed_docs = build_pageindex(
                     documents
                 )
-                add_to_vectorstore(split_docs)
+                add_to_vectorstore(
+                    indexed_docs
+                )
+                tree = create_document_tree(
+                    indexed_docs
+                )
+                st.sidebar.subheader(
+                    "📑 Document Structure"
+                )
+                st.sidebar.json(tree)
+            
             st.sidebar.success(
-                "Documents processed successfully!"
+                "✅ Documents processed successfully!"
             )
+            
         else:
             st.sidebar.warning(
                 "Please upload files"
@@ -248,11 +325,17 @@ with col2:
         except:
             pass
         vectorstore = Chroma(
+            collection_name="rag_collection",
             persist_directory="./chroma_db",
             embedding_function=embeddings
         )
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k":5}
+        )
         st.session_state.processed_files = set()
         st.sidebar.success("Database cleared successfully!")
+
 query = st.text_input(
     "Enter your question",
     placeholder="Example: What is RAG?"
@@ -264,14 +347,22 @@ if st.button("Generate Answer") and query:
     st.markdown("## Answer")
     st.success(answer)
     if docs:
-        st.markdown("## 📄 Sources")
+        st.markdown("## 📄 Retrieved Sections")
 
         for i, doc in enumerate(docs):
-            with st.expander(f"Source {i+1}"):
+            with st.expander(
+                f"""
+                Section {i+1}
+                | {doc.metadata.get('section_title')}
+                """
+            ):
                 st.write(doc.page_content)
                 st.caption(
-                    f"📁 File: {doc.metadata.get('source')} | "
-                    f"📄 Page: {doc.metadata.get('page')}"
+                    f"""
+                    📁 File: {doc.metadata.get('source')}
+                    📄 Page: {doc.metadata.get('page')}
+                    🧩 Section ID: {doc.metadata.get('section_id')}
+                    """
                 )
     else: 
         st.warning(" No source found")
